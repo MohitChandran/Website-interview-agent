@@ -1,0 +1,383 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>AI Interview Bot</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>AI Interview Bot</h1>
+            <p class="subtitle">Powered by Digitide</p>
+        </header>
+
+        <div class="main-content">
+            <!-- Candidate Form Section -->
+            <div class="form-section" id="formSection">
+                <h2>Candidate Information</h2>
+                <form id="candidateForm">
+                    <div class="form-group">
+                        <label for="name">Full Name</label>
+                        <input type="text" id="name" name="name" required placeholder="Enter your name" />
+                    </div>
+                    <div class="form-group">
+                        <label for="role">Role Applied For</label>
+                        <input type="text" id="role" name="role" required placeholder="e.g., Software Engineer" />
+                    </div>
+                    <div class="form-group">
+                        <label for="resume">Upload Resume (PDF)</label>
+                        <input type="file" id="resume" name="resume" accept=".pdf" required />
+                    </div>
+                    <button type="submit" class="btn btn-primary" id="uploadBtn">Upload & Prepare</button>
+                </form>
+                <div id="uploadStatus" class="status-message"></div>
+            </div>
+
+            <!-- Interview Section (Hidden Initially) -->
+            <div class="interview-section" id="interviewSection" style="display: none;">
+                <div class="interview-header">
+                    <h2>Interview Session</h2>
+                    <div class="status-indicator" id="statusIndicator">
+                        <span class="status-dot"></span>
+                        <span id="statusText">Ready</span>
+                    </div>
+                </div>
+
+                <!-- Chat/Transcript Window -->
+                <div class="chat-window" id="chatWindow">
+                    <div class="chat-message system">
+                        <strong>System:</strong> Click "Start Interview" to begin.
+                    </div>
+                </div>
+
+                <!-- Controls -->
+                <div class="controls">
+                    <button class="btn btn-success" id="startBtn">Start Interview</button>
+                    <button class="btn btn-danger" id="stopBtn" style="display: none;">End Interview</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Configuration
+        const API_BASE = window.location.origin;
+        const WS_PROTOCOL = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const WS_BASE = `${WS_PROTOCOL}//${window.location.host}`;
+
+        // State
+        let sessionId = null;
+        let websocket = null;
+        let audioStream = null;
+        let audioContext = null;
+        let processor = null;
+        let source = null;
+        let isInterviewActive = false;
+        let candidateName = '';
+        let currentAudio = null;
+
+        // DOM Elements
+        const candidateForm = document.getElementById('candidateForm');
+        const formSection = document.getElementById('formSection');
+        const interviewSection = document.getElementById('interviewSection');
+        const uploadStatus = document.getElementById('uploadStatus');
+        const chatWindow = document.getElementById('chatWindow');
+        const statusText = document.getElementById('statusText');
+        const statusIndicator = document.getElementById('statusIndicator');
+        const startBtn = document.getElementById('startBtn');
+        const stopBtn = document.getElementById('stopBtn');
+
+        // Form Submission Handler
+        candidateForm.addEventListener('submit', async (e) => {
+            e.preventDefault();
+
+            const formData = new FormData();
+            const name = document.getElementById('name').value.trim();
+            const role = document.getElementById('role').value.trim();
+            const resume = document.getElementById('resume').files[0];
+
+            candidateName = name;
+
+            formData.append('name', name);
+            formData.append('role', role);
+            formData.append('resume', resume);
+
+            try {
+                uploadStatus.textContent = 'Uploading resume...';
+                uploadStatus.className = 'status-message info';
+                document.getElementById('uploadBtn').disabled = true;
+
+                const response = await fetch(`${API_BASE}/api/upload-resume`, {
+                    method: 'POST',
+                    body: formData,
+                });
+
+                const result = await response.json();
+
+                if (result.success && result.session_id) {
+                    sessionId = result.session_id;
+                    uploadStatus.textContent = 'Upload successful! Ready to start interview.';
+                    uploadStatus.className = 'status-message success';
+
+                    // Show interview section
+                    setTimeout(() => {
+                        formSection.style.display = 'none';
+                        interviewSection.style.display = 'block';
+                    }, 1000);
+                } else {
+                    throw new Error(result.message || 'Upload failed');
+                }
+            } catch (error) {
+                console.error('Upload error:', error);
+                uploadStatus.textContent = `Error: ${error.message}`;
+                uploadStatus.className = 'status-message error';
+                document.getElementById('uploadBtn').disabled = false;
+            }
+        });
+
+        // Start Interview
+        startBtn.addEventListener('click', async () => {
+            try {
+                updateStatus('Requesting microphone access...', 'warning');
+                audioStream = await navigator.mediaDevices.getUserMedia({
+                    audio: {
+                        echoCancellation: true,
+                        noiseSuppression: true,
+                        sampleRate: 16000,
+                        channelCount: 1,
+                    },
+                });
+
+                updateStatus('Connecting...', 'warning');
+                connectWebSocket();
+
+                startAudioStreaming();
+
+                startBtn.style.display = 'none';
+                stopBtn.style.display = 'inline-block';
+            } catch (error) {
+                console.error('Microphone access error:', error);
+                addChatMessage('system', `Error: Could not access microphone. ${error.message}`);
+                updateStatus('Error', 'error');
+            }
+        });
+
+        // Stop Interview
+        stopBtn.addEventListener('click', () => {
+            endInterview();
+        });
+
+        // WebSocket Connection
+        function connectWebSocket() {
+            const wsUrl = `${WS_BASE}/ws/interview/${sessionId}`;
+            console.log('Connecting to WebSocket:', wsUrl);
+
+            websocket = new WebSocket(wsUrl);
+
+            websocket.onopen = () => {
+                console.log('WebSocket connected');
+                updateStatus('Connected - Starting interview...', 'success');
+                isInterviewActive = true;
+            };
+
+            websocket.onmessage = async (event) => {
+                try {
+                    const data = JSON.parse(event.data);
+                    console.log('Received message:', data.type);
+
+                    if (data.type === 'ai_response') {
+                        handleAIResponse(data);
+                    } else if (data.type === 'interview_end') {
+                        handleInterviewEnd(data);
+                    } else if (data.type === 'stop_ai_audio') {
+                        // Stop any currently playing AI audio immediately
+                        if (currentAudio) {
+                            try { currentAudio.pause(); } catch (e) {}
+                            try { currentAudio.src = ''; } catch (e) {}
+                            currentAudio = null;
+                        }
+                        updateStatus('Listening...', 'listening');
+                        if (websocket && websocket.readyState === WebSocket.OPEN) {
+                            websocket.send(JSON.stringify({ type: 'ai_audio_completed' }));
+                        }
+                    }
+                } catch (error) {
+                    console.error('Error processing message:', error);
+                }
+            };
+
+            websocket.onerror = (error) => {
+                console.error('WebSocket error:', error);
+                updateStatus('Connection error', 'error');
+            };
+
+            websocket.onclose = () => {
+                console.log('WebSocket closed');
+                if (isInterviewActive) {
+                    updateStatus('Disconnected', 'error');
+                }
+            };
+        }
+
+        // Start Audio Streaming using Web Audio API raw PCM capture
+        function startAudioStreaming() {
+            if (!audioStream) return;
+
+            try {
+                audioContext = new AudioContext({ sampleRate: 16000 });
+                source = audioContext.createMediaStreamSource(audioStream);
+
+                processor = audioContext.createScriptProcessor(4096, 1, 1);
+
+                processor.onaudioprocess = (e) => {
+                    const inputBuffer = e.inputBuffer.getChannelData(0);
+                    // Convert Float32Array [-1..1] to Int16 PCM little endian bytes
+                    const buffer = new ArrayBuffer(inputBuffer.length * 2);
+                    const view = new DataView(buffer);
+                    for (let i = 0; i < inputBuffer.length; i++) {
+                        let s = Math.max(-1, Math.min(1, inputBuffer[i]));
+                        view.setInt16(i * 2, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+                    }
+
+                    if (websocket && websocket.readyState === WebSocket.OPEN) {
+                        websocket.send(buffer);
+                    }
+                };
+
+                source.connect(processor);
+                processor.connect(audioContext.destination);
+
+                console.log('Audio streaming started (raw PCM)');
+                updateStatus('Listening...', 'listening');
+            } catch (error) {
+                console.error('Audio streaming error:', error);
+                addChatMessage('system', `Audio streaming error: ${error.message}`);
+            }
+        }
+
+        // Handle AI Response
+        function handleAIResponse(data) {
+            const { text, audio } = data;
+
+            // Display AI message
+            addChatMessage('ai', text);
+
+            // Play audio
+            if (audio) {
+                updateStatus('AI speaking...', 'speaking');
+                playAudio(audio);
+            }
+        }
+
+        // Play Base64 Audio
+        function playAudio(base64Audio) {
+            try {
+                const audioUrl = `data:audio/mpeg;base64,${base64Audio}`;
+                if (currentAudio) {
+                    try { currentAudio.pause(); } catch (e) {}
+                }
+                currentAudio = new Audio(audioUrl);
+
+                currentAudio.onended = () => {
+                    console.log('Audio playback finished');
+                    currentAudio = null;
+                    if (isInterviewActive) {
+                        updateStatus('Listening...', 'listening');
+                        if (websocket && websocket.readyState === WebSocket.OPEN) {
+                            websocket.send(JSON.stringify({ type: 'ai_audio_completed' }));
+                        }
+                    }
+                };
+
+                currentAudio.onerror = (error) => {
+                    console.error('Audio playback error:', error);
+                    updateStatus('Audio error', 'error');
+                };
+
+                currentAudio.play();
+            } catch (error) {
+                console.error('Error playing audio:', error);
+            }
+        }
+
+        // Handle Interview End
+        function handleInterviewEnd(data) {
+            const message = data.message || 'Thank you for participating in this interview. Good luck!';
+            addChatMessage('system', message);
+            endInterview();
+        }
+
+        // End Interview
+        function endInterview() {
+            isInterviewActive = false;
+
+            // Stop audio processor and close audio context
+            if (processor) {
+                processor.disconnect();
+            }
+            if (source) {
+                source.disconnect();
+            }
+            if (audioContext) {
+                audioContext.close();
+            }
+
+            // Stop audio stream
+            if (audioStream) {
+                audioStream.getTracks().forEach((track) => track.stop());
+            }
+
+            // Close WebSocket
+            if (websocket) {
+                websocket.close();
+            }
+
+            // Stop any current AI audio
+            if (currentAudio) {
+                try { currentAudio.pause(); } catch (e) {}
+                try { currentAudio.src = ''; } catch (e) {}
+                currentAudio = null;
+            }
+
+            updateStatus('Interview Complete', 'complete');
+            stopBtn.style.display = 'none';
+
+            addChatMessage('system', 'Interview session ended. You may close this window.');
+        }
+
+        // Add Chat Message
+        function addChatMessage(type, text) {
+            const messageDiv = document.createElement('div');
+            messageDiv.className = `chat-message ${type}`;
+
+            let label = '';
+            if (type === 'ai') {
+                label = '<strong>Nikki (AI):</strong> ';
+            } else if (type === 'candidate') {
+                label = `<strong>${candidateName}:</strong> `;
+            } else if (type === 'system') {
+                label = '<strong>System:</strong> ';
+            }
+
+            messageDiv.innerHTML = label + text;
+            chatWindow.appendChild(messageDiv);
+            chatWindow.scrollTop = chatWindow.scrollHeight;
+        }
+
+        // Update Status
+        function updateStatus(text, state) {
+            statusText.textContent = text;
+            statusIndicator.className = `status-indicator ${state}`;
+        }
+
+        // Cleanup on page unload
+        window.addEventListener('beforeunload', () => {
+            if (isInterviewActive) {
+                endInterview();
+            }
+        });
+    </script>
+</body>
+</html>
